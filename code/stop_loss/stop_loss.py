@@ -1,6 +1,7 @@
 import math
-from code.entry_exit_rules.entry_exit import Bar, PositionDirection, has_level
-from typing import Optional
+from entry_exit_rules.entry_exit import Bar, PositionDirection, has_level
+from atr_module.atr_module import get_atr_from_bars
+from typing import List, Optional
 
 
 class StopLossManager:
@@ -16,21 +17,25 @@ class StopLossManager:
     Stop loss is fixed once at entry and then stays unchanged.
     """
 
-    VALID_MODES = {"fixed", "structural", "bos"}
+    VALID_MODES = {"fixed", "structural", "bos", "atr"}
 
     def __init__(
         self,
         mode: str = "fixed",
         fixed_pct: float = 0.01,
         buffer_pct: float = 0.001,
+        k_sl: float = 2.0,
+        atr_period: int = 14,
     ):
         """
         Initialize stop loss manager.
 
         Args:
-            mode: SL mode ("fixed" | "structural" | "bos")
+            mode: SL mode ("fixed" | "structural" | "bos" | "atr")
             fixed_pct: Percent of entry for fixed mode (e.g., 0.01 = 1%)
             buffer_pct: Buffer percent of entry for structural and bos
+            k_sl: ATR multiplier for atr mode (LONG: SL = entry - k_sl*ATR, SHORT: SL = entry + k_sl*ATR)
+            atr_period: ATR period for atr mode
 
         Raises:
             ValueError: If mode is invalid or parameters are non-positive
@@ -43,10 +48,14 @@ class StopLossManager:
             raise ValueError(f"fixed_pct must be > 0, got {fixed_pct}")
         if buffer_pct < 0:
             raise ValueError(f"buffer_pct cannot be negative, got {buffer_pct}")
+        if mode == "atr" and (k_sl <= 0 or atr_period <= 0):
+            raise ValueError(f"atr mode: k_sl and atr_period must be > 0, got k_sl={k_sl}, atr_period={atr_period}")
 
         self.mode = mode
         self.fixed_pct = fixed_pct
         self.buffer_pct = buffer_pct
+        self.k_sl = k_sl
+        self.atr_period = atr_period
         self.reset()
 
     def reset(self) -> None:
@@ -68,6 +77,8 @@ class StopLossManager:
         last_swing_high: Optional[float] = None,
         last_swing_low: Optional[float] = None,
         signal_bar: Optional[Bar] = None,
+        bars: Optional[List[Bar]] = None,
+        entry_candle_index: Optional[int] = None,
     ) -> float:
         """
         Compute and fix stop loss on position entry.
@@ -79,6 +90,8 @@ class StopLossManager:
             last_swing_low: Last swing low price (used in structural for LONG)
             signal_bar: BOS candle t (closed at t, entry at open t+1).
                 StopLossManager does not compute BOS — caller responsibility.
+            bars: Full bar history for ATR mode (data up to and including entry bar only).
+            entry_candle_index: Bar index of entry candle for ATR mode.
 
         Returns:
             float: Calculated stop loss price
@@ -87,6 +100,7 @@ class StopLossManager:
             RuntimeError: If manager is already active (reset() not called)
             ValueError: If required parameters for the chosen mode are missing
             ValueError: If entry_price <= 0
+            ValueError: If ATR is invalid in atr mode (refuse trade)
         """
         if self.active:
             raise RuntimeError(
@@ -101,6 +115,16 @@ class StopLossManager:
 
         if self.mode == "fixed":
             self.stop_price = self._fixed_sl()
+
+        elif self.mode == "atr":
+            if bars is None or entry_candle_index is None:
+                raise ValueError("For 'atr' mode you must provide bars and entry_candle_index.")
+            atr = get_atr_from_bars(bars, entry_candle_index, self.atr_period)
+            if not math.isfinite(atr) or atr <= 0:
+                raise ValueError(
+                    f"ATR invalid at entry bar (atr={atr}); cannot set stop. Refuse trade."
+                )
+            self.stop_price = self._atr_sl(atr)
 
         elif self.mode == "structural":
             if direction == PositionDirection.LONG:
@@ -177,6 +201,14 @@ class StopLossManager:
         """
         buffer = self.entry_price * self.buffer_pct
         return last_swing_high + buffer
+
+    def _atr_sl(self, atr: float) -> float:
+        """
+        Compute stop loss for atr mode: LONG SL = entry - k_sl*ATR, SHORT SL = entry + k_sl*ATR.
+        """
+        if self.direction == PositionDirection.LONG:
+            return self.entry_price - self.k_sl * atr
+        return self.entry_price + self.k_sl * atr
 
     def _bos_sl(self, signal_bar: Bar) -> float:
         """

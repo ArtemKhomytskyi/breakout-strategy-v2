@@ -6,8 +6,8 @@ import math
 import pandas as pd
 from datetime import timedelta
 
-from code.swing_high_low_detection import swing_highs_lows_online
-from code.entry_exit import (
+from swing_high_low_detection.swing_high_low_detection import swing_highs_lows_online
+from entry_exit_rules.entry_exit import (
     Bar as SimBar,
     SwingLevels,
     PositionDirection,
@@ -17,9 +17,12 @@ from code.entry_exit import (
     detect_bos_signal,
     plan_trade_from_signal,
     check_exit_rules,
+    check_partial_1r_reached,
+    compute_trailing_stop,
 )
-from code.stop_loss import StopLossManager
-from code.risk import RiskConfig, size_position
+from stop_loss.stop_loss import StopLossManager
+from risk_management.risk import RiskConfig, size_position
+from atr_module.atr_module import get_atr_from_bars
 
 
 class BosBreakoutEth15m(QCAlgorithm):
@@ -52,15 +55,22 @@ class BosBreakoutEth15m(QCAlgorithm):
         self.tp_mode = TakeProfitMode.RR_BASED
         self.tp_mult = 3.0
 
+        # Partial exit at 1R then ATR trailing on remainder
+        self.partial_exit_pct = 0.5
+        self.partial_exit_at_r = 1.0
+        self.k_trail = 2.0
+        self.atr_period_trailing = 14
+
         self.same_bar_rule = SameBarSlTpRule.WORST_CASE
         self.cooldown_bars = 0
         self.max_trades_per_day = None
 
-        # Keep same risk sizing style from project
+        # Percent-of-equity risk sizing
         self.risk_config = RiskConfig(
-            risk_budget_cash=100.0,
-            max_quantity=None,
-            min_risk_per_unit=None,
+            risk_pct=0.01,
+            max_position_size=None,
+            min_stop_distance=None,
+            max_leverage=None,
             use_buying_power_cap=False,
         )
         self.qty_decimals = 6
@@ -99,6 +109,9 @@ class BosBreakoutEth15m(QCAlgorithm):
         self.pending_exit_price = None
         self.entry_fill_price = None
         self.entry_fill_time = None
+        self.partial_exit_done = False
+        self.trailing_stop_price = None
+        self.remaining_qty = 0.0
 
         # Stats
         self.stat_bos = 0
@@ -192,6 +205,7 @@ class BosBreakoutEth15m(QCAlgorithm):
                 tp_mode=self.tp_mode,
                 tp_mult=self.tp_mult,
                 risk_config=self.risk_config,
+                equity=float(self.Portfolio.TotalPortfolioValue),
                 buying_power_cash=float(self.Portfolio.Cash),
                 position_sizer=self._position_sizer_fractional,
             )
@@ -270,12 +284,29 @@ class BosBreakoutEth15m(QCAlgorithm):
 
         if self.exit_ticket and orderEvent.OrderId == self.exit_ticket.OrderId:
             if orderEvent.Status in [OrderStatus.Filled, OrderStatus.PartiallyFilled]:
+                reason = self.pending_exit_reason if self.pending_exit_reason is not None else "UNKNOWN"
+                is_partial_1r = reason == "PARTIAL_1R"
+
+                if is_partial_1r and self.Portfolio[self.symbol].Invested:
+                    # Partial exit fill: keep position open, activate trailing
+                    filled_qty = abs(float(orderEvent.FillQuantity))
+                    self.remaining_qty = abs(float(self.Portfolio[self.symbol].Quantity))
+                    self.active_qty = self.remaining_qty
+                    self.partial_exit_done = True
+                    self.trailing_stop_price = float(self.active_sl_price)
+                    if self.entry_fill_price is not None and orderEvent.FillPrice > 0:
+                        pnl = (float(orderEvent.FillPrice) - self.entry_fill_price) * filled_qty
+                        self.total_trade_pnl += pnl
+                    self.exit_ticket = None
+                    self.pending_exit_reason = None
+                    self.pending_exit_price = None
+                    self.state = "OPEN"
+                    return
+
                 if self.Portfolio[self.symbol].Invested:
                     return
 
                 fill_price = float(orderEvent.FillPrice) if orderEvent.FillPrice > 0 else 0.0
-                reason = self.pending_exit_reason if self.pending_exit_reason is not None else "UNKNOWN"
-
                 if reason == "SL":
                     self.stat_sl += 1
                 elif reason == "TP":
@@ -359,33 +390,76 @@ class BosBreakoutEth15m(QCAlgorithm):
         if self.exit_ticket is not None and self._has_open_orders():
             return True
 
+        sl_price = float(self.active_sl_price)
+        if self.partial_exit_done:
+            # Trailing phase: update stop on bar close then check exit
+            atr = get_atr_from_bars(self.bars_15m, self.bar_index, self.atr_period_trailing)
+            sl_price = compute_trailing_stop(
+                close=bar.close,
+                atr=atr,
+                direction=self.trade_plan.direction,
+                old_stop=sl_price,
+                k_trail=self.k_trail,
+            )
+            self.active_sl_price = sl_price
+            self.trailing_stop_price = sl_price
+            # Only trailing SL can trigger; use far TP so it never hits
+            if self.trade_plan.direction == PositionDirection.LONG:
+                tp_price = (self.entry_fill_price or self.trade_plan.entry_price) + 1e9
+            else:
+                tp_price = 0.0
+        else:
+            tp_price = float(self.active_tp_price)
+
         exit_event = check_exit_rules(
             bar=bar,
             direction=self.trade_plan.direction,
-            sl_price=float(self.active_sl_price),
-            tp_price=float(self.active_tp_price),
+            sl_price=sl_price,
+            tp_price=tp_price,
             same_bar_rule=self.same_bar_rule,
         )
-        if exit_event is None:
-            return False
-
-        qty_to_close = -float(self.Portfolio[self.symbol].Quantity)
-        qty_to_close = self._round_quantity(qty_to_close)
-
-        if qty_to_close == 0:
+        if exit_event is not None:
+            qty_to_close = -float(self.Portfolio[self.symbol].Quantity)
+            qty_to_close = self._round_quantity(qty_to_close)
+            if qty_to_close != 0:
+                self.pending_exit_reason = exit_event.exit_reason.value
+                self.pending_exit_price = float(exit_event.exit_price)
+                self.state = "EXIT_SUBMITTED"
+                self.exit_ticket = self.MarketOrder(
+                    self.symbol,
+                    qty_to_close,
+                    tag=f"EXIT|{self.pending_exit_reason}",
+                )
+                return True
             self._clear_trade_state(mark_cooldown=True)
             return True
 
-        self.pending_exit_reason = exit_event.exit_reason.value
-        self.pending_exit_price = float(exit_event.exit_price)
+        # Not partial_exit_done: check if 1R reached for partial exit
+        if not self.partial_exit_done and check_partial_1r_reached(
+            bar=bar,
+            direction=self.trade_plan.direction,
+            entry_price=self.entry_fill_price or self.trade_plan.entry_price,
+            sl_price=float(self.active_sl_price),
+            r_mult=self.partial_exit_at_r,
+        ):
+            current_qty = float(self.Portfolio[self.symbol].Quantity)
+            qty_to_close = -current_qty * self.partial_exit_pct
+            qty_to_close = self._round_quantity(qty_to_close)
+            if qty_to_close != 0:
+                self.pending_exit_reason = "PARTIAL_1R"
+                r = abs((self.entry_fill_price or self.trade_plan.entry_price) - self.active_sl_price)
+                self.pending_exit_price = (self.entry_fill_price or self.trade_plan.entry_price) + (
+                    r if self.trade_plan.direction == PositionDirection.LONG else -r
+                )
+                self.state = "EXIT_SUBMITTED"
+                self.exit_ticket = self.MarketOrder(
+                    self.symbol,
+                    qty_to_close,
+                    tag="EXIT|PARTIAL_1R",
+                )
+                return True
 
-        self.state = "EXIT_SUBMITTED"
-        self.exit_ticket = self.MarketOrder(
-            self.symbol,
-            qty_to_close,
-            tag=f"EXIT|{self.pending_exit_reason}",
-        )
-        return True
+        return False
 
     def _position_sizer_fractional(self, **kwargs):
         qty, reason = size_position(
@@ -476,6 +550,9 @@ class BosBreakoutEth15m(QCAlgorithm):
         self.pending_exit_price = None
         self.entry_fill_price = None
         self.entry_fill_time = None
+        self.partial_exit_done = False
+        self.trailing_stop_price = None
+        self.remaining_qty = 0.0
 
         if mark_cooldown and self.cooldown_bars > 0:
             self.cooldown_until = self.bar_index + self.cooldown_bars

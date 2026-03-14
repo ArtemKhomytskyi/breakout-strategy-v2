@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
-from code.risk_management.risk import RiskConfig, size_position
+from risk_management.risk import RiskConfig, size_position
 
 # IMPORTANT:
 # If your stop_loss module imports Bar and PositionDirection from this file,
@@ -19,6 +19,7 @@ class PositionDirection(str, Enum):
 class ExitReason(str, Enum):
     SL = "SL"
     TP = "TP"
+    PARTIAL_1R = "PARTIAL_1R"
 
 
 class TakeProfitMode(str, Enum):
@@ -230,6 +231,7 @@ def plan_trade_from_signal(
     tp_mode: TakeProfitMode,
     tp_mult: float,
     risk_config: RiskConfig,
+    equity: float,
     buying_power_cash: Optional[float] = None,
     position_sizer=size_position,
 ) -> TradePlan:
@@ -255,19 +257,24 @@ def plan_trade_from_signal(
     entry_price = bars[entry_candle_index].open
 
     # Stop Loss is fixed at entry using your stop-loss module.
-    sl_price = stop_loss_manager.on_entry(
-        direction=bos_signal.direction,
-        entry_price=entry_price,
-        last_swing_high=swing_levels.last_swing_high_price,
-        last_swing_low=swing_levels.last_swing_low_price,
-        signal_bar=bars[t],
-    )
+    on_entry_kw: dict = {
+        "direction": bos_signal.direction,
+        "entry_price": entry_price,
+        "last_swing_high": swing_levels.last_swing_high_price,
+        "last_swing_low": swing_levels.last_swing_low_price,
+        "signal_bar": bars[t],
+    }
+    if getattr(stop_loss_manager, "mode", None) == "atr":
+        on_entry_kw["bars"] = bars
+        on_entry_kw["entry_candle_index"] = entry_candle_index
+    sl_price = stop_loss_manager.on_entry(**on_entry_kw)
 
     qty, refuse_reason = position_sizer(
         direction=bos_signal.direction,
         entry_price=entry_price,
         sl_price=sl_price,
         risk_config=risk_config,
+        equity=equity,
         buying_power_cash=buying_power_cash,
     )
     if qty is None or qty <= 0:
@@ -354,3 +361,47 @@ def check_exit_rules(
         )
 
     raise ValueError(f"Unsupported same_bar_rule: {same_bar_rule}")
+
+
+def check_partial_1r_reached(
+    *,
+    bar: Bar,
+    direction: PositionDirection,
+    entry_price: float,
+    sl_price: float,
+    r_mult: float = 1.0,
+) -> bool:
+    """
+    True if price reached 1R (r_mult * R) on this bar. R = abs(entry - sl).
+    LONG: True if bar.high >= entry + r_mult * R.
+    SHORT: True if bar.low <= entry - r_mult * R.
+    """
+    r = abs(entry_price - sl_price)
+    if r <= 0:
+        return False
+    one_r = r_mult * r
+    if direction == PositionDirection.LONG:
+        return bar.high >= entry_price + one_r
+    return bar.low <= entry_price - one_r
+
+
+def compute_trailing_stop(
+    *,
+    close: float,
+    atr: float,
+    direction: PositionDirection,
+    old_stop: float,
+    k_trail: float,
+) -> float:
+    """
+    Compute new trailing stop from bar close and ATR (trailing updates only after candle close).
+    LONG: new_stop = max(old_stop, close - k_trail * ATR)
+    SHORT: new_stop = min(old_stop, close + k_trail * ATR)
+    """
+    if not math.isfinite(atr) or atr <= 0:
+        return old_stop
+    if direction == PositionDirection.LONG:
+        candidate = close - k_trail * atr
+        return max(old_stop, candidate)
+    candidate = close + k_trail * atr
+    return min(old_stop, candidate)
