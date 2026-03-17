@@ -61,6 +61,9 @@ class BosBreakoutEth15m(QCAlgorithm):
         self.k_trail = 2.0
         self.atr_period_trailing = 14
 
+        # Breakout buffer (ATR-based, filters micro false breaks)
+        self.k_buffer = 2.0  # ATR multiplier (0.0 = disabled)
+
         self.same_bar_rule = SameBarSlTpRule.WORST_CASE
         self.cooldown_bars = 0
         self.max_trades_per_day = None
@@ -185,10 +188,13 @@ class BosBreakoutEth15m(QCAlgorithm):
         if signal_t < 0:
             return
 
+        atr = get_atr_from_bars(self.bars_15m, signal_t, self.atr_period_trailing)
         bos_signal = detect_bos_signal(
             bars=self.bars_15m,
             t=signal_t,
             swing_levels=self.swing_levels,
+            k_buffer=self.k_buffer,
+            atr=atr,
         )
         if bos_signal is None:
             return

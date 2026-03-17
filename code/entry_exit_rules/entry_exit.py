@@ -65,14 +65,14 @@ def has_level(level: Optional[float]) -> bool:
     return level is not None and not (isinstance(level, float) and math.isnan(level))
 
 
-def bos_up(close: float, last_high: Optional[float]) -> bool:
-    """Break of structure to the upside."""
-    return has_level(last_high) and close > last_high  # type: ignore[arg-type]
+def bos_up(close: float, last_high: Optional[float], buffer: float = 0.0) -> bool:
+    """Break of structure to the upside with optional buffer."""
+    return has_level(last_high) and close > last_high + buffer
 
 
-def bos_down(close: float, last_low: Optional[float]) -> bool:
-    """Break of structure to the downside."""
-    return has_level(last_low) and close < last_low  # type: ignore[arg-type]
+def bos_down(close: float, last_low: Optional[float], buffer: float = 0.0) -> bool:
+    """Break of structure to the downside with optional buffer."""
+    return has_level(last_low) and close < last_low - buffer
 
 
 def update_last_swing_levels(
@@ -139,15 +139,29 @@ class TradeExit:
     exit_reason: ExitReason
 
 
-def detect_bos_signal(*, bars: list[Bar], t: int, swing_levels: SwingLevels) -> Optional[BosSignal]:
+def detect_bos_signal(
+    *,
+    bars: list[Bar],
+    t: int,
+    swing_levels: SwingLevels,
+    k_buffer: float = 0.0,
+    atr: Optional[float] = None,
+) -> Optional[BosSignal]:
     """
-    V1 BOS definition:
+    V2 BOS definition with optional ATR-based breakout buffer:
 
-      - BOS Long:  Close[t] > lastSwingHighPrice
-      - BOS Short: Close[t] < lastSwingLowPrice
+      - BOS Long:  Close[t] > lastSwingHighPrice + buffer
+      - BOS Short: Close[t] < lastSwingLowPrice - buffer
 
     Signal is evaluated on the CLOSE of bar t.
     Entry requires bar t+1 to exist (executed on Open[t+1]).
+    
+    Args:
+        bars: List of Bar objects
+        t: Current bar index for signal detection
+        swing_levels: Current swing levels
+        k_buffer: ATR multiplier for breakout buffer (default 0.0 = no buffer)
+        atr: ATR value (optional, required if k_buffer > 0)
     """
     if t < 0 or t >= len(bars):
         raise IndexError("Bar index out of range.")
@@ -157,16 +171,21 @@ def detect_bos_signal(*, bars: list[Bar], t: int, swing_levels: SwingLevels) -> 
         return None
 
     close_t = bars[t].close
+    
+    # Calculate buffer from ATR
+    buffer = 0.0
+    if atr is not None and k_buffer > 0 and not math.isnan(atr):
+        buffer = k_buffer * atr
 
     if not has_level(swing_levels.last_swing_high_price):
-        assert not bos_up(close_t, swing_levels.last_swing_high_price)
+        assert not bos_up(close_t, swing_levels.last_swing_high_price, buffer=buffer)
     if not has_level(swing_levels.last_swing_low_price):
-        assert not bos_down(close_t, swing_levels.last_swing_low_price)
+        assert not bos_down(close_t, swing_levels.last_swing_low_price, buffer=buffer)
 
-    if bos_up(close_t, swing_levels.last_swing_high_price):
+    if bos_up(close_t, swing_levels.last_swing_high_price, buffer=buffer):
         return BosSignal(direction=PositionDirection.LONG, signal_candle_index=t)
 
-    if bos_down(close_t, swing_levels.last_swing_low_price):
+    if bos_down(close_t, swing_levels.last_swing_low_price, buffer=buffer):
         return BosSignal(direction=PositionDirection.SHORT, signal_candle_index=t)
 
     return None
