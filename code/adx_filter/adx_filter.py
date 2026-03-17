@@ -24,15 +24,10 @@ from typing import List, Union
 
 import pandas as pd
 
+from atr_module.atr_module import wilder_smooth
+
 DEFAULT_ADX_PERIOD = 14
 DEFAULT_ADX_THRESHOLD = 25
-
-
-def _wilder_smooth(series: pd.Series, period: int) -> pd.Series:
-    """Wilder's smoothing: alpha = 1/period."""
-    return series.ewm(alpha=1.0 / period, adjust=False).mean()
-
-
 def compute_adx(
     high: Union[pd.Series, List[float]],
     low: Union[pd.Series, List[float]],
@@ -80,16 +75,16 @@ def compute_adx(
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
 
-    atr = _wilder_smooth(tr, period)
+    atr = wilder_smooth(tr, period)
     atr_ok = atr > 1e-10
     plus_di = (
-        (100 * _wilder_smooth(plus_dm, period) / atr)
+        (100 * wilder_smooth(plus_dm, period) / atr)
         .where(atr_ok, 0.0)
         .replace([float("inf"), float("-inf")], 0.0)
         .fillna(0)
     )
     minus_di = (
-        (100 * _wilder_smooth(minus_dm, period) / atr)
+        (100 * wilder_smooth(minus_dm, period) / atr)
         .where(atr_ok, 0.0)
         .replace([float("inf"), float("-inf")], 0.0)
         .fillna(0)
@@ -104,7 +99,7 @@ def compute_adx(
         .fillna(0)
     )
 
-    adx = _wilder_smooth(dx, period)
+    adx = wilder_smooth(dx, period)
     adx = adx.replace([float("inf"), float("-inf")], 0.0).fillna(0)
     return adx
 

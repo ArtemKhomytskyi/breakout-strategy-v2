@@ -23,6 +23,8 @@ from entry_exit_rules.entry_exit import (
 from stop_loss.stop_loss import StopLossManager
 from risk_management.risk import RiskConfig, size_position
 from atr_module.atr_module import get_atr_from_bars
+from ma_regime_filter.ma_regime_filter import get_regime_from_bars
+from RSI.momentum_confirmation_rsi import RSIEngine, RSIMomentumFilter, RSIMomentumMode
 
 
 class BosBreakoutEth15m(QCAlgorithm):
@@ -83,16 +85,48 @@ class BosBreakoutEth15m(QCAlgorithm):
         self.N_confirmation = 3
         self.min_move_threshold = 0.0
         self.min_bars_between_swings = 3
-        self.required_warmup_bars = max(self.N_candidates) + self.N_confirmation + 20
+
+        # RSI momentum confirmation
+        self.rsi_enabled = True
+        self.rsi_period = 14
+        self.rsi_mode = RSIMomentumMode.THRESHOLD
+        self.rsi_long_threshold = 55.0
+        self.rsi_short_threshold = 45.0
+        self.rsi_cross_level_long = 50.0
+        self.rsi_cross_level_short = 50.0
+        self.rsi_bull_support = 45.0
+        self.rsi_bear_resistance = 55.0
+        self.rsi_regime_ema_period = 200
+        self.rsi_warmup_bars = self.rsi_period + 2
+        if self.rsi_mode == RSIMomentumMode.CROSS:
+            self.rsi_warmup_bars += 1
+        if self.rsi_mode == RSIMomentumMode.TREND_RANGE:
+            self.rsi_warmup_bars = max(self.rsi_warmup_bars, self.rsi_regime_ema_period)
+
+        self.required_warmup_bars = max(
+            max(self.N_candidates) + self.N_confirmation + 20,
+            self.rsi_warmup_bars,
+        )
 
         self.stop_loss_manager = StopLossManager(
             mode=self.sl_mode,
             fixed_pct=self.fixed_pct,
             buffer_pct=self.buffer_pct,
         )
+        self.rsi_engine = RSIEngine(length=self.rsi_period)
+        self.rsi_filter = RSIMomentumFilter(
+            mode=self.rsi_mode,
+            long_threshold=self.rsi_long_threshold,
+            short_threshold=self.rsi_short_threshold,
+            cross_level_long=self.rsi_cross_level_long,
+            cross_level_short=self.rsi_cross_level_short,
+            bull_support=self.rsi_bull_support,
+            bear_resistance=self.rsi_bear_resistance,
+        )
 
         self.swing_levels = SwingLevels()
         self.bars_15m = []
+        self.rsi_values = []
         self.last_applied_swing_bar_index = -1
 
         self.bar_index = 0
@@ -126,7 +160,9 @@ class BosBreakoutEth15m(QCAlgorithm):
         self.stat_sl = 0
         self.stat_tp = 0
         self.stat_entry_reject = 0
+        self.stat_rsi_blocked = 0
         self.plan_fail_log_count = 0
+        self.rsi_block_log_count = 0
         self.total_trade_pnl = 0.0
 
         self.consolidator = TradeBarConsolidator(timedelta(minutes=15))
@@ -134,7 +170,8 @@ class BosBreakoutEth15m(QCAlgorithm):
         self.SubscriptionManager.AddConsolidator(self.symbol, self.consolidator)
 
         self.Debug(
-            "READY | ETHUSD 15m | sl=fixed(1%), tp=RR(3.0), same_bar=WORST_CASE, cooldown=0, max_trades_day=None"
+            f"READY | ETHUSD 15m | sl=fixed(1%), tp=RR(3.0), same_bar=WORST_CASE, cooldown=0, "
+            f"max_trades_day=None, rsi={self.rsi_mode.value}({self.rsi_period})"
         )
 
     def OnData(self, data: Slice):
@@ -152,8 +189,21 @@ class BosBreakoutEth15m(QCAlgorithm):
 
         self.bars_15m.append(sim_bar)
         self.bar_index += 1
+        current_rsi = self.rsi_engine.update(sim_bar.close)
+        self.rsi_values.append(current_rsi)
 
         self.Plot("Price", "Close", sim_bar.close)
+        if current_rsi is not None:
+            self.Plot("RSI", "RSI", current_rsi)
+        if self.rsi_mode == RSIMomentumMode.THRESHOLD:
+            self.Plot("RSI", "LongGate", self.rsi_long_threshold)
+            self.Plot("RSI", "ShortGate", self.rsi_short_threshold)
+        elif self.rsi_mode == RSIMomentumMode.CROSS:
+            self.Plot("RSI", "LongGate", self.rsi_cross_level_long)
+            self.Plot("RSI", "ShortGate", self.rsi_cross_level_short)
+        else:
+            self.Plot("RSI", "LongGate", self.rsi_bull_support)
+            self.Plot("RSI", "ShortGate", self.rsi_bear_resistance)
 
         day = tb.EndTime.date()
         if self.current_day is None or day != self.current_day:
@@ -200,6 +250,10 @@ class BosBreakoutEth15m(QCAlgorithm):
             return
 
         self.stat_bos += 1
+
+        if self.rsi_enabled and not self._rsi_allows_entry(signal_t, bos_signal.direction):
+            return
+
         self.stop_loss_manager.reset()
 
         try:
@@ -341,7 +395,7 @@ class BosBreakoutEth15m(QCAlgorithm):
         self.Debug(
             f"DONE | Trades={self.stat_entries} Exits={self.stat_exit} SL={self.stat_sl} TP={self.stat_tp} "
             f"BOS={self.stat_bos} PlanOK={self.stat_plan_ok} PlanFail={self.stat_plan_fail} "
-            f"Qty0Skips={self.stat_skip_qty0} EntryReject={self.stat_entry_reject} "
+            f"Qty0Skips={self.stat_skip_qty0} EntryReject={self.stat_entry_reject} RSIBlocked={self.stat_rsi_blocked} "
             f"ApproxPnL={self.total_trade_pnl:.2f}"
         )
 
@@ -399,7 +453,7 @@ class BosBreakoutEth15m(QCAlgorithm):
         sl_price = float(self.active_sl_price)
         if self.partial_exit_done:
             # Trailing phase: update stop on bar close then check exit
-            atr = get_atr_from_bars(self.bars_15m, self.bar_index, self.atr_period_trailing)
+            atr = get_atr_from_bars(self.bars_15m, len(self.bars_15m) - 1, self.atr_period_trailing)
             sl_price = compute_trailing_stop(
                 close=bar.close,
                 atr=atr,
@@ -465,6 +519,35 @@ class BosBreakoutEth15m(QCAlgorithm):
                 )
                 return True
 
+        return False
+
+    def _rsi_allows_entry(self, signal_bar_index: int, direction: PositionDirection) -> bool:
+        rsi_now = self.rsi_values[signal_bar_index] if signal_bar_index < len(self.rsi_values) else None
+        rsi_prev = self.rsi_values[signal_bar_index - 1] if signal_bar_index > 0 else None
+        regime = None
+        if self.rsi_mode == RSIMomentumMode.TREND_RANGE:
+            regime = get_regime_from_bars(self.bars_15m, signal_bar_index, self.rsi_regime_ema_period)
+
+        decision = self.rsi_filter.allow_entry(
+            direction=direction,
+            rsi_now=rsi_now,
+            rsi_prev=rsi_prev,
+            regime=regime,
+        )
+        if decision.allowed:
+            return True
+
+        self.stat_rsi_blocked += 1
+        if self.rsi_block_log_count < 25:
+            rsi_text = f"{decision.rsi_value:.2f}" if decision.rsi_value is not None else "n/a"
+            prev_text = f"{decision.previous_rsi_value:.2f}" if decision.previous_rsi_value is not None else "n/a"
+            threshold_text = f"{decision.threshold:.2f}" if decision.threshold is not None else "n/a"
+            regime_text = decision.regime if decision.regime is not None else "n/a"
+            self.Debug(
+                f"RSI BLOCK {self.bars_15m[signal_bar_index].time} | Dir={direction.value} Mode={decision.mode.value} "
+                f"Reason={decision.reason} RSI={rsi_text} Prev={prev_text} Threshold={threshold_text} Regime={regime_text}"
+            )
+            self.rsi_block_log_count += 1
         return False
 
     def _position_sizer_fractional(self, **kwargs):

@@ -26,9 +26,44 @@ import pandas as pd
 DEFAULT_ATR_PERIOD = 14
 
 
-def _wilder_smooth(series: pd.Series, period: int) -> pd.Series:
-    """Wilder's smoothing: alpha = 1/period."""
-    return series.ewm(alpha=1.0 / period, adjust=False).mean()
+def wilder_smooth(series: Union[pd.Series, List[float]], period: int) -> pd.Series:
+    """
+    Wilder's smoothing (RMA) seeded with a simple average.
+
+    The first non-NaN value is emitted at index ``period - 1`` and is the simple
+    average of the first ``period`` observations. Later values use the standard
+    Wilder recurrence:
+
+        rma[t] = (rma[t-1] * (period - 1) + value[t]) / period
+    """
+    if period <= 0:
+        raise ValueError(f"period must be > 0, got {period}")
+
+    if isinstance(series, list):
+        series = pd.Series(series, dtype=float)
+    else:
+        series = series.astype(float).copy()
+
+    smoothed = pd.Series(float("nan"), index=series.index, dtype=float)
+    if len(series) < period:
+        return smoothed
+
+    seed = float(series.iloc[:period].mean())
+    smoothed.iloc[period - 1] = seed
+
+    prev = seed
+    for i in range(period, len(series)):
+        prev = wilder_smooth_step(prev, float(series.iloc[i]), period)
+        smoothed.iloc[i] = prev
+
+    return smoothed
+
+
+def wilder_smooth_step(previous_value: float, new_value: float, period: int) -> float:
+    """Single-step Wilder smoothing update."""
+    if period <= 0:
+        raise ValueError(f"period must be > 0, got {period}")
+    return ((previous_value * (period - 1)) + new_value) / period
 
 
 def compute_true_range(
@@ -101,7 +136,7 @@ def compute_atr(
         close = pd.Series(close)
 
     tr = compute_true_range(high, low, close)
-    atr = _wilder_smooth(tr, period)
+    atr = wilder_smooth(tr, period)
     atr = atr.replace([float("inf"), float("-inf")], float("nan"))
     return atr
 
