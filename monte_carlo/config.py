@@ -1,32 +1,78 @@
-"""Monte Carlo simulation configuration object."""
+"""
+Monte Carlo simulation configuration.
 
-from dataclasses import dataclass
+## Design decisions
+
+- `path_method`: Two simulation modes are supported.
+  - 'GBM' (Geometric Brownian Motion): assumes log-normally distributed returns.
+    Fast, analytically tractable, good for broad scenario generation.
+  - 'BOOTSTRAP': resamples directly from the observed historical return series.
+    Naturally captures fat tails, negative skewness, and volatility clustering
+    that GBM misses. Preferred when tail behavior matters most (i.e., for risk).
+
+- `drift_mode`: For risk evaluation, 'zero' drift is the conservative default.
+  We are stress-testing the trade, not predicting direction. Using historical
+  drift biases paths in a direction that may not hold going forward.
+
+- `rolling_window`: Uses only the most recent N bars to estimate sigma/drift.
+  This avoids look-ahead bias and keeps volatility estimates current.
+
+- `regime_sigma_multipliers`: A dict mapping regime labels (e.g. 'CRASH') to
+  sigma scaling factors. During high-vol regimes, flat historical sigma
+  underestimates true risk. A 1.5x multiplier in crash conditions produces
+  more realistic tail scenarios for risk decisions.
+
+- `num_simulations_for_opt`: A reduced simulation count for use inside the
+  Optuna optimizer where many MC runs are evaluated per trial. Lower than
+  num_simulations to keep wall time acceptable; accuracy is sufficient for
+  threshold optimization since it averages over many trials.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
 
 @dataclass
 class MCConfig:
     """Configuration for Monte Carlo simulations.
-    
+
     Attributes:
-        num_simulations: Number of Monte Carlo paths to simulate
-        horizon_bars: Number of bars to simulate (max path length)
-        use_log_returns: Whether to use log returns for calculations
-        drift_mode: Method for calculating drift ('historical', 'zero', 'custom')
-        sigma_mode: Method for calculating volatility ('historical', 'ewma', 'custom')
-        rolling_window: Number of recent bars for volatility/drift estimation
-        random_seed: Random seed for reproducibility (None for random)
-        var_confidence: Confidence level for Value at Risk (e.g., 0.95)
-        cvar_confidence: Confidence level for Conditional Value at Risk (e.g., 0.95)
+        num_simulations:    Number of Monte Carlo paths to simulate per trade evaluation.
+        horizon_bars:       Maximum number of bars to simulate per path.
+        use_log_returns:    Whether to use log returns internally (always True; kept for API compat).
+        drift_mode:         'zero' (conservative default) | 'historical' | 'custom'.
+        sigma_mode:         'historical' (rolling std of log returns).
+        rolling_window:     Number of recent bars used to compute sigma and drift.
+        random_seed:        Seed for reproducibility. None = random each run.
+        var_confidence:     Confidence level for VaR (e.g. 0.95 → worst 5th percentile).
+        cvar_confidence:    Confidence level for CVaR (same convention as var_confidence).
+        path_method:        'GBM' for parametric simulation, 'BOOTSTRAP' for historical resampling.
+        bootstrap_lookback: Number of historical bars to draw from in BOOTSTRAP mode.
+        regime_sigma_multipliers: Mapping of regime name → sigma scale factor.
+                            Applied before path generation. E.g. {'CRASH': 1.5, 'HIGH_VOL': 1.25}.
+        num_simulations_for_opt: Reduced sim count used inside the Optuna optimizer to keep
+                            optimization wall time manageable (default 500).
     """
-    num_simulations: int = 10000
+    num_simulations: int = 10_000
     horizon_bars: int = 500
     use_log_returns: bool = True
-    drift_mode: str = 'historical'
+    drift_mode: str = 'zero'
     sigma_mode: str = 'historical'
     rolling_window: int = 20
-    random_seed: int | None = None
+    random_seed: Optional[int] = None
     var_confidence: float = 0.95
     cvar_confidence: float = 0.95
 
+    # Path simulation method
+    path_method: str = 'GBM'
+    bootstrap_lookback: int = 252
 
-# Default configuration instance
+    # Regime-conditioned volatility
+    regime_sigma_multipliers: dict = field(default_factory=dict)
+
+    # Optimizer-specific reduced simulation count
+    num_simulations_for_opt: int = 500
+
+
+# Default configuration instance — conservative settings suitable for live use.
 default_config = MCConfig()
