@@ -104,7 +104,7 @@ def generate_paths(market_state: MarketState, config: MCConfig) -> np.ndarray:
 
     # --- Path generation ---
     if config.path_method == 'BOOTSTRAP':
-        _fill_bootstrap(prices, market_state, config, rng, S0, num_paths, num_steps)
+        _fill_bootstrap(prices, market_state, config, rng, S0, num_paths, num_steps, regime_mult)
     else:
         # Default: GBM
         _fill_gbm(prices, sigma, drift, rng, S0, num_paths, num_steps)
@@ -133,7 +133,8 @@ def _fill_gbm(prices: np.ndarray, sigma: float, drift: float,
 
 def _fill_bootstrap(prices: np.ndarray, market_state: MarketState,
                     config: MCConfig, rng: np.random.Generator,
-                    S0: float, num_paths: int, num_steps: int) -> None:
+                    S0: float, num_paths: int, num_steps: int,
+                    regime_mult: float = 1.0) -> None:
     """Fill price matrix using historical bootstrap resampling.
 
     Draws log-returns with replacement from the recent return history.
@@ -146,6 +147,12 @@ def _fill_bootstrap(prices: np.ndarray, market_state: MarketState,
     The bootstrap_lookback cap (default 252 bars ≈ 1 trading year) limits
     the pool to recent market conditions. Using very old data risks including
     regimes that are no longer relevant.
+
+    Fix #2: when drift_mode='zero' the pool is demeaned so the conservative
+    zero-drift contract holds (raw resampling would inject the recent trend).
+    Fix #1: regime_sigma_multipliers are applied here too — deviations around the
+    pool mean are scaled by regime_mult so stressed regimes widen the tails
+    (previously this only affected GBM).
     """
     returns = market_state.recent_returns
     if not returns or len(returns) < 10:
@@ -165,6 +172,18 @@ def _fill_bootstrap(prices: np.ndarray, market_state: MarketState,
         drift = 0.0 if config.drift_mode == "zero" else float(market_state.drift)
         _fill_gbm(prices, sigma, drift, rng, S0, num_paths, num_steps)
         return
+
+    # Fix #2 — honor drift_mode='zero': raw returns carry their own sample mean,
+    # so resampling them directly injects the recent trend. Demean to keep paths driftless.
+    if config.drift_mode == "zero":
+        pool = pool - pool.mean()
+
+    # Fix #1 — apply the regime sigma multiplier in bootstrap too. Scale deviations
+    # around the (preserved) pool mean so stressed regimes widen the tails without
+    # shifting the central tendency.
+    if regime_mult != 1.0:
+        m = pool.mean()
+        pool = m + (pool - m) * regime_mult
 
     # Sample with replacement: shape (num_paths, num_steps)
     sampled = rng.choice(pool, size=(num_paths, num_steps), replace=True)

@@ -428,6 +428,11 @@ def scenario_6_crash_regime() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # Ensure UTF-8 output so the glyphs below (✓ ✗ σ → ≈) don't raise
+    # UnicodeEncodeError on consoles using a non-UTF-8 codepage (e.g. Windows cp1251).
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
     print(f"\n{'#' * _W}")
     print("  Monte Carlo Risk Module — Standalone Diagnostic")
     print("  All entries are anchored to S0 (last close of each market state).")

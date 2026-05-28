@@ -370,6 +370,8 @@ def _objective(
 
     min_kelly = trial.suggest_float('min_kelly_fraction', 0.0, 0.15)
     reduce_size_factor = trial.suggest_float('reduce_size_factor', 0.25, 0.75)
+    # Fix #6: tune the deeply-negative-EV reject gate too (was pinned at the -0.5 default).
+    min_expected_pnl_r = trial.suggest_float('min_expected_pnl_r', -1.0, 0.1)
 
     try:
         decision_config = DecisionConfig(
@@ -379,6 +381,7 @@ def _objective(
             reduce_var_r=reduce_var_r,
             min_kelly_fraction=min_kelly,
             reduce_size_factor=reduce_size_factor,
+            min_expected_pnl_r=min_expected_pnl_r,
         )
     except ValueError:
         # Invalid threshold combination (violates DecisionConfig constraints).
@@ -461,4 +464,5 @@ def _params_to_decision_config(params: dict) -> DecisionConfig:
         reduce_var_r=params.get('reduce_var_r', -2.0),
         min_kelly_fraction=params.get('min_kelly_fraction', 0.05),
         reduce_size_factor=params.get('reduce_size_factor', 0.5),
+        min_expected_pnl_r=params.get('min_expected_pnl_r', -0.5),
     )

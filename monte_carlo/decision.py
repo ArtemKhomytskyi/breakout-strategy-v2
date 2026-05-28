@@ -203,7 +203,7 @@ def make_trade_decision(metrics: RiskMetrics, config: DecisionConfig) -> TradeDe
             reason=(
                 f"VaR_r={metrics.var_r:.3f}R <= "
                 f"reject threshold={config.reject_var_r:.3f}R. "
-                f"Tail loss too severe (worst {(1-0.95)*100:.0f}% of simulations exceed this)."
+                f"Tail loss too severe (the VaR-quantile outcome is below the reject threshold)."
             ),
             **snapshot,
         )
